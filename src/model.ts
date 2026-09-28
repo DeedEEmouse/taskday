@@ -1,4 +1,4 @@
-export type Kind = 'daily' | 'interval' | 'weekly' | 'monthly' | 'yearly'
+export type Kind = 'once' | 'daily' | 'interval' | 'weekly' | 'monthly' | 'yearly'
 export type Mode = 'manual' | 'weighted' | 'equal'
 
 export type Task = {
@@ -48,6 +48,7 @@ export const formatDate = (key: string) =>
 
 export function isDue(task: Task, key: string) {
   if (key < task.created_on || (task.archived_on && key >= task.archived_on)) return false
+  if (task.kind === 'once') return task.anchor_date === key
   if (task.kind === 'daily') return true
   const date = parseDate(key)
   if (task.kind === 'weekly') return task.weekdays.includes(date.getDay())
@@ -62,20 +63,20 @@ export function isDue(task: Task, key: string) {
   return false
 }
 
-export function allocate(tasks: Task[], mode: Mode): Task[] {
-  const daily = tasks.filter(t => t.kind === 'daily' && !t.archived_on)
-  if (!daily.length || mode === 'manual') return tasks
-  const weights = daily.map(t => mode === 'equal' ? 1 : Math.max(1, t.weight))
+export function allocateForDay(tasks: Task[], mode: Mode): Map<string, number> {
+  if (!tasks.length) return new Map()
+  const ordered = [...tasks].sort((a, b) => a.sort_order - b.sort_order || a.id.localeCompare(b.id))
+  const weights = ordered.map(t => mode === 'equal' ? 1 : Math.max(1, mode === 'weighted' ? t.weight : t.points))
   const weightSum = weights.reduce((a, b) => a + b, 0)
-  const remaining = 100 - daily.length
+  const base = ordered.length <= 100 ? 1 : 0
+  const remaining = 100 - base * ordered.length
   const fractions = weights.map(w => remaining * w / weightSum)
-  const shares = fractions.map(f => Math.floor(f))
-  let left = remaining - shares.reduce((a, b) => a + b, 0)
+  const shares = fractions.map(f => Math.floor(f) + base)
+  const left = 100 - shares.reduce((a, b) => a + b, 0)
   const order = fractions.map((f, i) => ({ i, fraction: f - Math.floor(f) }))
     .sort((a, b) => b.fraction - a.fraction || a.i - b.i)
   for (let i = 0; i < left; i++) shares[order[i].i]++
-  const points = new Map(daily.map((task, i) => [task.id, shares[i] + 1]))
-  return tasks.map(t => points.has(t.id) ? { ...t, points: points.get(t.id)! } : t)
+  return new Map(ordered.map((task, i) => [task.id, shares[i]]))
 }
 
 export function scoreForDay(store: Store, key: string) {
@@ -83,16 +84,19 @@ export function scoreForDay(store: Store, key: string) {
   const due = store.tasks.filter(t => isDue(t, key))
   const done = store.completions.filter(c => c.occurrence_key === key)
   const doneIds = new Set(done.map(c => c.task_id))
-  const bonus = daily.length > 0 && daily.every(t => doneIds.has(t.id)) ? 20 : 0
-  const points = done.reduce((sum, c) => sum + c.awarded_points, 0) + bonus
-  return { due, daily, doneIds, bonus, points, dailyDone: daily.filter(t => doneIds.has(t.id)).length }
+  const allocation = allocateForDay(due, store.mode)
+  const doneCount = due.filter(t => doneIds.has(t.id)).length
+  const allowedMisses = due.length >= 10 ? 2 : due.length >= 6 ? 1 : 0
+  const bonus = due.length > 0 && due.length - doneCount <= allowedMisses ? 20 : 0
+  const points = due.reduce((sum, task) => sum + (doneIds.has(task.id) ? allocation.get(task.id) ?? 0 : 0), 0) + bonus
+  return { due, daily, doneIds, allocation, bonus, points, doneCount, allowedMisses, dailyDone: daily.filter(t => doneIds.has(t.id)).length }
 }
 
 export function makeTask(title: string, kind: Kind, today: string, userId: string, order: number): Task {
   return {
     id: crypto.randomUUID(), user_id: userId, title: title.trim(), kind,
-    points: kind === 'daily' ? 1 : 10, weight: 1, interval_days: kind === 'interval' ? 1 : null,
-    anchor_date: kind === 'interval' ? today : null,
+    points: 10, weight: 1, interval_days: kind === 'interval' ? 1 : null,
+    anchor_date: kind === 'interval' || kind === 'once' ? today : null,
     weekdays: kind === 'weekly' ? [parseDate(today).getDay()] : [],
     day_of_month: kind === 'monthly' || kind === 'yearly' ? parseDate(today).getDate() : null,
     month_of_year: kind === 'yearly' ? parseDate(today).getMonth() + 1 : null,

@@ -4,9 +4,9 @@
 
 ## 規則
 
-- 每日任務至少一項，總共 100 分；可平均分配、自訂分數，或設定權重按比例分配。
-- 當天所有每日任務完成，再得 20 分。回看已完成的日期也會顯示該獎勵。
-- 非每日任務每個排定日完成得 10 分：隔 n 天（每 n+1 天一次）、每週多選日期、每月指定日期、每年指定日期。
+- **當天排定的所有任務**合計 100 分（沒有任務則 0 分）。可平均、依權重或自訂相對比例分配；任務出現的日期不同，分數會跟著重新換算。若一天超過 100 項任務，部分任務可能分得 0 分。
+- 額外 20 分依當天任務總數判定：1–5 項須全部完成，6–9 項可少做 1 項，10 項以上可少做 2 項；沒有任務不給獎勵。
+- 不重複任務只在指定日期出現一次。重複任務可選每天、隔 n 天（每 n+1 天一次）、每週多選日期、每月指定日期或每年指定日期。
 - 每月 29–31 日若該月沒有指定日期，這次略過。任務從建立日開始出現；封存後不再出現，完成紀錄保留。
 - 日期依使用者瀏覽器時區顯示。
 - Beta：開發者帳號可使用雙欄一日行程表，左欄記預計、右欄記實際；可拖選連續小時建立一塊內容、點方塊編輯、長按拖動方塊改時間。待辦分成待完成和已完成；行程連結待辦後，共用完成狀態。一般帳號不顯示此頁；資料庫也拒絕一般帳號直接讀寫行程。
@@ -25,7 +25,7 @@ npm run dev
 ## 連結 Supabase
 
 1. 建立 Supabase 專案，在 **SQL Editor** 執行 [`supabase/schema.sql`](supabase/schema.sql)。
-   如果既有網站已執行過 `schema.sql`，依序執行 [`supabase/beta_upgrade.sql`](supabase/beta_upgrade.sql)、[`supabase/beta_timeline_upgrade.sql`](supabase/beta_timeline_upgrade.sql)；新專案則依序執行三份。若你已套用第一版 Beta，只需執行 `beta_timeline_upgrade.sql`。**資料庫升級完成後才部署此版前端。**
+   如果既有網站已執行過 `schema.sql`，依序執行 [`supabase/beta_upgrade.sql`](supabase/beta_upgrade.sql)、[`supabase/beta_timeline_upgrade.sql`](supabase/beta_timeline_upgrade.sql)、[`supabase/beta_scoring_upgrade.sql`](supabase/beta_scoring_upgrade.sql)；新專案則依序執行四份。已套用過的檔案不用重跑。**資料庫升級完成後才部署此版前端。**
 2. 在 **Authentication → Providers** 啟用 Email 登入。若啟用「Confirm email」，註冊者須先收信驗證。
 3. 複製 `.env.example` 為 `.env.local`，填入專案 URL 和 **publishable key**：
 
@@ -59,7 +59,7 @@ on conflict (user_id) do update set role = excluded.role;
 
 將此目錄推到你的 Git 儲存庫，於 Vercel 匯入專案，Framework Preset 選 **Vite**。Build Command `npm run build`、Output Directory `dist`。到 Vercel 專案的 Environment Variables 填入上面兩個 `VITE_` 變數後重新部署。最後將實際部署網域加入 Supabase Authentication 的 URL Configuration。
 
-建議先以 Git 的 Beta 分支建立 Vercel Preview Deployment。新版必須先執行兩份 Beta 資料庫升級檔（已套用第一份者只需第二份），再將程式碼部署到 Vercel；原本的一般使用者功能維持可用。
+建議先以 Git 的 Beta 分支建立 Vercel Preview Deployment。從第一版網站升級，需要先依序執行三份 Beta 資料庫升級檔，再將程式碼推到 `beta` 分支；已套用過的檔案不用重跑。此 SQL 會擴充原本的資料表，不會清空任務或完成紀錄。
 
 ### 不透過 GitHub 外掛部署預覽版
 
@@ -70,13 +70,13 @@ npx vercel link
 npx vercel deploy
 ```
 
-`vercel link` 請選現有專案，`vercel deploy` 會產生 Preview URL，不會取代正式網站。確認現有 Vercel 專案已設定 `VITE_SUPABASE_URL` 與 `VITE_SUPABASE_PUBLISHABLE_KEY` 的 Preview 環境變數，並把 Preview URL 加入 Supabase Auth redirect URLs。先執行兩份 Beta SQL，再試用行程功能。
+`vercel link` 請選現有專案，`vercel deploy` 會產生 Preview URL，不會取代正式網站。確認現有 Vercel 專案已設定 `VITE_SUPABASE_URL` 與 `VITE_SUPABASE_PUBLISHABLE_KEY` 的 Preview 環境變數，並把 Preview URL 加入 Supabase Auth redirect URLs。先執行尚未套用的 Beta SQL，再試用行程功能。
 
 目前的登入實作採用 Supabase Auth 電子郵件／密碼。如果之後決定使用 Clerk 等獨立登入服務，需要把其使用者身分與 Supabase RLS 串接，不能只替換登入畫面。
 
 ## 備註
 
 - 分數是個人進度紀錄；前端不提供跨使用者排名或可信的競賽結算。
-- 更改每日分配後，當天已完成任務的分數會更新；過去日期的得分保留完成當時的分數。修改或封存任務可能改變舊日期的「全數完成」獎勵判斷；正式上線若需要不可變的歷史帳本，需新增每日快照與交易式寫入。
+- 積分紀錄會依目前的任務與權重設定重新換算，包括過去日期；已儲存的完成紀錄仍保留。若日後需要不可變的歷史分數，需新增每日快照與交易式寫入。
 - 登入資料目前一次載入最近 2,000 筆完成紀錄；資料量更大時應增加分頁或依日期查詢。
 - 行程表依照提供的截圖設計成左右雙欄時間軸；尚未匯入 Notion 資料。
