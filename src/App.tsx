@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useState, type FormEvent } from 'react'
-import { ArrowLeft, ArrowRight, CalendarDays, Check, ChevronRight, CircleHelp, LayoutList, LogOut, Medal, Plus, Settings2, Sparkles, Trash2, X } from 'lucide-react'
+import { ArrowLeft, ArrowRight, CalendarDays, CalendarRange, Check, ChevronRight, CircleHelp, LayoutList, LogOut, Medal, Plus, Settings2, Sparkles, Trash2, X } from 'lucide-react'
 import type { User } from '@supabase/supabase-js'
 import { allocate, dateKey, formatDate, makeTask, parseDate, scoreForDay, seedDemo, shiftDate, type Completion, type Kind, type Mode, type Store, type Task } from './model'
 import { supabase } from './supabase'
+import Planner, { type ScheduleEntry } from './Planner'
 
-type View = 'today' | 'manage' | 'history'
+type View = 'today' | 'manage' | 'history' | 'planner'
 const today = () => dateKey(new Date())
 const weekdays = ['日', '一', '二', '三', '四', '五', '六']
 const modeLabel: Record<Mode, string> = { manual: '自由分配', weighted: '依權重分配', equal: '平均分配' }
@@ -107,6 +108,8 @@ export default function App() {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [store, setStore] = useState<Store>(() => loadDemo())
+  const [role, setRole] = useState<'user' | 'developer'>('user')
+  const [schedule, setSchedule] = useState<ScheduleEntry[]>([])
   const [selected, setSelected] = useState(today())
   const [view, setView] = useState<View>('today')
   const [editing, setEditing] = useState<Task | null | 'new'>(null)
@@ -122,23 +125,61 @@ export default function App() {
   }, [])
 
   useEffect(() => {
-    if (demo) { setStore(loadDemo()); return }
-    if (!user || !supabase) return
+    if (demo) { setStore(loadDemo()); setRole('user'); setSchedule([]); return }
+    if (!user || !supabase) { setRole('user'); setSchedule([]); return }
+    const client = supabase
     let canceled = false
+    setRole('user')
     setLoading(true)
     Promise.all([
-      supabase.from('tasks').select('*').eq('user_id', user.id).order('sort_order'),
-      supabase.from('completions').select('*').eq('user_id', user.id).order('completed_on', { ascending: false }).limit(2000),
-      supabase.from('settings').select('allocation_mode').eq('user_id', user.id).maybeSingle(),
-    ]).then(([tasks, completions, settings]) => {
+      client.from('tasks').select('*').eq('user_id', user.id).order('sort_order'),
+      client.from('completions').select('*').eq('user_id', user.id).order('completed_on', { ascending: false }).limit(2000),
+      client.from('settings').select('allocation_mode').eq('user_id', user.id).maybeSingle(),
+      client.from('user_roles').select('role').eq('user_id', user.id).maybeSingle(),
+    ]).then(async ([tasks, completions, settings, userRole]) => {
       if (canceled) return
       const issue = tasks.error ?? completions.error ?? settings.error
       if (issue) setError(`資料載入失敗：${issue.message}。請確認已執行資料庫設定檔。`)
-      else { setStore({ tasks: tasks.data as Task[], completions: completions.data as Completion[], mode: (settings.data?.allocation_mode ?? 'equal') as Mode }); setError('') }
+      else {
+        setStore({ tasks: tasks.data as Task[], completions: completions.data as Completion[], mode: (settings.data?.allocation_mode ?? 'equal') as Mode })
+        if (userRole.error) setError(`Beta 權限載入失敗：${userRole.error.message}。請執行 beta_upgrade.sql。`)
+        else {
+          const nextRole = userRole.data?.role === 'developer' ? 'developer' : 'user'
+          setRole(nextRole)
+          if (nextRole === 'developer') {
+            const result = await client.from('schedule_entries').select('*').eq('user_id', user.id).order('day').limit(2000)
+            if (canceled) return
+            if (result.error) setError(`行程載入失敗：${result.error.message}`)
+            else { setSchedule(result.data as ScheduleEntry[]); setError('') }
+          } else { setSchedule([]); setError('') }
+        }
+      }
       setLoading(false)
     })
     return () => { canceled = true }
   }, [demo, user])
+
+  useEffect(() => { if (role !== 'developer' && view === 'planner') setView('today') }, [role, view])
+
+  async function saveSchedule(entry: ScheduleEntry) {
+    if (busy || !supabase || !user || role !== 'developer') return false
+    setBusy(true); setError('')
+    const { data, error: problem } = await supabase.from('schedule_entries').upsert({ ...entry, user_id: user.id }).select().single()
+    setBusy(false)
+    if (problem) { setError(`行程儲存失敗：${problem.message}`); return false }
+    setSchedule(items => [...items.filter(item => item.id !== data.id), data as ScheduleEntry])
+    return true
+  }
+
+  async function deleteSchedule(entry: ScheduleEntry) {
+    if (busy || !supabase || !user || role !== 'developer') return false
+    setBusy(true); setError('')
+    const { error: problem } = await supabase.from('schedule_entries').delete().eq('id', entry.id).eq('user_id', user.id)
+    setBusy(false)
+    if (problem) { setError(`行程刪除失敗：${problem.message}`); return false }
+    setSchedule(items => items.filter(item => item.id !== entry.id))
+    return true
+  }
 
   useEffect(() => {
     const daily = store.tasks.filter(t => t.kind === 'daily' && !t.archived_on)
@@ -191,14 +232,14 @@ export default function App() {
     await commit(makeNext(store, [], [t.id]))
   }
 
-  function toggle(t: Task) {
+  async function toggle(t: Task) {
     if (selected > today() || busy) return
     const old = store.completions.find(c => c.task_id === t.id && c.occurrence_key === selected)
     const completions = old ? store.completions.filter(c => c.id !== old.id) : [...store.completions, {
       id: crypto.randomUUID(), user_id: demo ? 'demo' : user!.id, task_id: t.id,
       occurrence_key: selected, completed_on: selected, awarded_points: t.points,
     }]
-    void commit({ ...store, completions })
+    await commit({ ...store, completions })
   }
 
   function changeMode(mode: Mode) {
@@ -229,28 +270,26 @@ export default function App() {
         <button className={view === 'today' ? 'nav-item active' : 'nav-item'} onClick={() => setView('today')}><LayoutList size={19}/> 每日任務 <ChevronRight size={16}/></button>
         <button className={view === 'manage' ? 'nav-item active' : 'nav-item'} onClick={() => setView('manage')}><Settings2 size={19}/> 任務設定 <ChevronRight size={16}/></button>
         <button className={view === 'history' ? 'nav-item active' : 'nav-item'} onClick={() => setView('history')}><CalendarDays size={19}/> 積分紀錄 <ChevronRight size={16}/></button>
+        {role === 'developer' && !demo && <button className={view === 'planner' ? 'nav-item active' : 'nav-item'} onClick={() => setView('planner')}><CalendarRange size={19}/> 一日行程表 <ChevronRight size={16}/></button>}
       </nav>
       <div className="sidebar-bottom"><div className="rule-card"><Sparkles size={19}/><strong>完成整天，額外 +20</strong><span>每日任務全部打勾就能取得。</span></div>
-        <div className="account"><div className="avatar">{demo ? '試' : (user?.email?.[0] ?? '我').toUpperCase()}</div><div><strong>{demo ? '示範模式' : user?.email}</strong><span>{demo ? '資料儲存在這個瀏覽器' : '資料已連結帳號'}</span></div>
+        <div className="account"><div className="avatar">{demo ? '試' : (user?.email?.[0] ?? '我').toUpperCase()}</div><div><strong>{demo ? '示範模式' : user?.email}</strong><span>{demo ? '資料儲存在這個瀏覽器' : role === 'developer' ? '開發者 · Beta 已開啟' : '資料已連結帳號'}</span></div>
           {demo && supabase ? <button className="icon-button" title="前往登入" aria-label="前往登入" onClick={() => setDemo(false)}><LogOut size={17}/></button> : !demo && supabase ? <button className="icon-button" title="登出" aria-label="登出" onClick={() => supabase?.auth.signOut()}><LogOut size={17}/></button> : null}</div>
       </div>
     </aside>
     <main className="main">
-      <header className="topbar"><div className="mobile-brand"><div className="brand-icon"><Check size={17}/></div> 日日進度</div><span className="topbar-label">{view === 'today' ? '今日總覽' : view === 'manage' ? '任務與分數' : '積分紀錄'}</span><span className="topbar-right">{demo ? '示範模式' : '我的空間'}</span></header>
+      <header className="topbar"><div className="mobile-brand"><div className="brand-icon"><Check size={17}/></div> 日日進度</div><span className="topbar-label">{view === 'today' ? '今日總覽' : view === 'manage' ? '任務與分數' : view === 'planner' ? '一日行程表 · Beta' : '積分紀錄'}</span>{!demo && supabase ? <button className="topbar-right account-action" onClick={() => void supabase?.auth.signOut()}><LogOut size={15}/>登出</button> : demo && supabase ? <button className="topbar-right account-action" onClick={() => setDemo(false)}>登入</button> : <span className="topbar-right">示範模式</span>}</header>
       <div className="content">{error && <div className="error-banner" role="alert">{error}<button aria-label="關閉錯誤訊息" onClick={() => setError('')}><X size={16}/></button></div>}
-      {loading ? <div className="loading-state">正在載入你的任務…</div> : view === 'today' ? <>
-        <div className="page-heading"><div><span className="eyebrow">YOUR DAILY PLAN</span><h1>今天，從這裡開始<span className="heading-dot">.</span></h1><p>把每件事做好，積分會替你記下來。</p></div><button className="primary" onClick={() => setEditing('new')}><Plus size={18}/> 新增任務</button></div>
+      {loading ? <div className="loading-state">正在載入你的任務…</div> : view === 'planner' && role === 'developer' && user && !demo ? <Planner day={selected} onDayChange={setSelected} entries={schedule} userId={user.id} busy={busy} tasks={todayScore.due} doneIds={todayScore.doneIds} onToggleTask={toggle} onSave={saveSchedule} onDelete={deleteSchedule}/> : view === 'today' ? <>
+        <div className="page-heading"><div><span className="eyebrow">YOUR DAILY PLAN</span><h1>今天，從這裡開始<span className="heading-dot">.</span></h1><p>把每件事做好，積分會替你記下來。</p></div><button className="primary add-task" aria-label="新增任務" onClick={() => setEditing('new')}><Plus size={18}/><span className="add-task-label">新增任務</span></button></div>
         <div className="date-controls"><div className="date-current"><CalendarDays size={18}/><strong>{formatDate(selected)}</strong>{selected === today() && <span className="today-pill">今天</span>}</div><div className="date-buttons"><button aria-label="前一天" onClick={() => setSelected(shiftDate(selected, -1))}><ArrowLeft size={18}/></button><button className="today-button" onClick={() => setSelected(today())}>回到今天</button><button aria-label="後一天" disabled={selected >= today()} onClick={() => setSelected(shiftDate(selected, 1))}><ArrowRight size={18}/></button></div></div>
         <div className="overview"><div className="overview-main"><div className="ring" style={{ '--progress': `${todayScore.daily.length ? Math.round(100 * todayScore.dailyDone / todayScore.daily.length) : 0}%` } as React.CSSProperties}><div><strong>{todayScore.daily.length ? Math.round(100 * todayScore.dailyDone / todayScore.daily.length) : 0}%</strong><span>每日完成度</span></div></div><div className="overview-copy"><span className="eyebrow">DAILY PROGRESS</span><h2>{todayScore.daily.length && todayScore.dailyDone === todayScore.daily.length ? '今天的每日任務完成了！' : '繼續累積今天的進度'}</h2><p>已完成 <strong>{todayScore.dailyDone}</strong> / {todayScore.daily.length} 項每日任務</p><div className="progress-track"><div style={{ width: `${todayScore.daily.length ? 100 * todayScore.dailyDone / todayScore.daily.length : 0}%` }}/></div></div></div><div className="overview-score"><Medal size={22}/><span>當日積分</span><div><strong>{todayScore.points}</strong><small>分</small></div><p>每日任務最多 100 分<br/>全數完成再加 20 分</p></div></div>
-        <div className="section-title"><div><h2>每日任務</h2><p>完成一項，拿到對應積分。</p></div><span>{todayScore.dailyDone} / {todayScore.daily.length} 已完成</span></div>
-        <div className="task-list">{sorted(todayScore.daily).map(t => <button className={`task-row ${todayScore.doneIds.has(t.id) ? 'done' : ''}`} key={t.id} disabled={selected > today() || busy} onClick={() => toggle(t)}><span className="checkbox">{todayScore.doneIds.has(t.id) && <Check size={17}/>}</span><span className="task-name">{t.title}</span><span className="point-pill">+{t.points} 分</span></button>)}
-          {!todayScore.daily.length && <div className="empty-state">這一天沒有每日任務。<button onClick={() => setEditing('new')}>新增第一項任務</button></div>}</div>
+        <div className="section-title"><div><h2>今日待辦</h2><p>完成一項，拿到對應積分。行程表連結的待辦會同步更新。</p></div><span>{todayScore.due.filter(t => todayScore.doneIds.has(t.id)).length} / {todayScore.due.length} 已完成</span></div>
+        <div className="todo-columns daily-todos"><section className="todo-group"><h3>待完成 <span>{todayScore.due.filter(t => !todayScore.doneIds.has(t.id)).length}</span></h3>{sorted(todayScore.due.filter(t => !todayScore.doneIds.has(t.id))).map(t => <button className="todo-item" key={t.id} disabled={selected > today() || busy} onClick={() => void toggle(t)}><span className="checkbox"/><span className="task-name">{t.title}<small>{t.kind === 'daily' ? '每日任務' : scheduleLabel(t)}</small></span><span className="point-pill">+{t.points} 分</span></button>)}{!todayScore.due.some(t => !todayScore.doneIds.has(t.id)) && <p className="todo-empty">今天的待辦都完成了。</p>}</section><section className="todo-group done"><h3>已完成 <span>{todayScore.due.filter(t => todayScore.doneIds.has(t.id)).length}</span></h3>{sorted(todayScore.due.filter(t => todayScore.doneIds.has(t.id))).map(t => <button className="todo-item" key={t.id} disabled={selected > today() || busy} onClick={() => void toggle(t)}><span className="checkbox"><Check size={15}/></span><span className="task-name">{t.title}<small>{t.kind === 'daily' ? '每日任務' : scheduleLabel(t)}</small></span></button>)}{!todayScore.due.some(t => todayScore.doneIds.has(t.id)) && <p className="todo-empty">完成後會移到這裡。</p>}</section></div>
+        {!todayScore.daily.length && <div className="empty-state">這一天沒有每日任務。<button onClick={() => setEditing('new')}>新增第一項任務</button></div>}
         {todayScore.bonus > 0 && <div className="bonus-banner"><Sparkles size={20}/><strong>全部完成獎勵</strong><span>+20 分已加入今天的積分</span></div>}
-        <div className="section-title repeat-heading"><div><h2>重複任務</h2><p>依照你設定的日期出現，每次完成得 10 分。</p></div><span>{todayScore.due.filter(t => t.kind !== 'daily').length} 項排定</span></div>
-        <div className="task-list">{sorted(todayScore.due.filter(t => t.kind !== 'daily')).map(t => <button className={`task-row ${todayScore.doneIds.has(t.id) ? 'done' : ''}`} key={t.id} disabled={selected > today() || busy} onClick={() => toggle(t)}><span className="checkbox">{todayScore.doneIds.has(t.id) && <Check size={17}/>}</span><span className="task-name">{t.title}<small>{scheduleLabel(t)}</small></span><span className="point-pill">+10 分</span></button>)}
-          {!todayScore.due.some(t => t.kind !== 'daily') && <div className="empty-state subtle">這一天沒有排定的重複任務。</div>}</div>
       </> : view === 'manage' ? <>
-        <div className="page-heading"><div><span className="eyebrow">SET YOUR RHYTHM</span><h1>任務設定<span className="heading-dot">.</span></h1><p>決定每天做什麼，以及 100 分如何分配。</p></div><button className="primary" onClick={() => setEditing('new')}><Plus size={18}/> 新增任務</button></div>
+        <div className="page-heading"><div><span className="eyebrow">SET YOUR RHYTHM</span><h1>任務設定<span className="heading-dot">.</span></h1><p>決定每天做什麼，以及 100 分如何分配。</p></div><button className="primary add-task" aria-label="新增任務" onClick={() => setEditing('new')}><Plus size={18}/><span className="add-task-label">新增任務</span></button></div>
         <section className="panel allocation"><div className="panel-heading"><div><span className="eyebrow">DAILY POINTS</span><h2>每日積分分配</h2><p>每日任務至少一項，總和固定 100 分。</p></div><div className="allocation-total"><strong>{store.mode === 'manual' ? draftTotal : pointsTotal}</strong><span>/ 100 分</span></div></div>
           <div className="mode-tabs" role="group" aria-label="積分分配方式">{(['equal', 'weighted', 'manual'] as Mode[]).map(mode => <button key={mode} className={store.mode === mode ? 'selected' : ''} disabled={busy} onClick={() => changeMode(mode)}>{modeLabel[mode]}</button>)}</div>
           <p className="mode-description">{store.mode === 'equal' ? '平均分給所有每日任務；餘數依任務順序各多分 1 分。' : store.mode === 'weighted' ? '先保證每項至少 1 分，再依權重比例分配其餘分數。' : '自行設定每項分數；全部相加必須剛好等於 100 分。'}</p>
@@ -270,7 +309,7 @@ export default function App() {
         <div className="section-title"><div><h2>每日明細</h2></div></div><div className="history-list">{[...recent].reverse().map(key => { const s = scoreForDay(store, key); return <button key={key} onClick={() => { setSelected(key); setView('today') }}><span>{formatDate(key)}<small>每日 {s.dailyDone}/{s.daily.length} · 重複任務 {s.due.filter(t => t.kind !== 'daily' && s.doneIds.has(t.id)).length} 項{s.bonus ? ' · 含全數完成獎勵' : ''}</small></span><strong>{s.points} 分</strong><ChevronRight size={18}/></button> })}</div>
       </>}
       </div>
-      <nav className="mobile-nav" aria-label="手機選單"><button className={view === 'today' ? 'active' : ''} onClick={() => setView('today')}><LayoutList size={20}/>任務</button><button className={view === 'manage' ? 'active' : ''} onClick={() => setView('manage')}><Settings2 size={20}/>設定</button><button className={view === 'history' ? 'active' : ''} onClick={() => setView('history')}><CalendarDays size={20}/>紀錄</button></nav>
+      <nav className="mobile-nav" aria-label="手機選單"><button className={view === 'today' ? 'active' : ''} onClick={() => setView('today')}><LayoutList size={20}/>任務</button><button className={view === 'manage' ? 'active' : ''} onClick={() => setView('manage')}><Settings2 size={20}/>設定</button><button className={view === 'history' ? 'active' : ''} onClick={() => setView('history')}><CalendarDays size={20}/>紀錄</button>{role === 'developer' && !demo && <button className={view === 'planner' ? 'active' : ''} onClick={() => setView('planner')}><CalendarRange size={20}/>行程</button>}</nav>
     </main>
     {editing && <TaskForm initial={editing === 'new' ? null : editing} copying={copying} onClose={() => { setEditing(null); setCopying(false) }} onSave={saveTask} />}
   </div>
